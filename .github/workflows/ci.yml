@@ -1,0 +1,72 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy pandas pytest
+      - name: Test feature registry
+        run: |
+          python - <<'PYEOF'
+          from store.registry import FeatureRegistry, Entity, FeatureView
+          reg = FeatureRegistry()
+          reg.register_entity(Entity('customer', 'customer_id'))
+          reg.register_feature_view(FeatureView('behavior', ['customer'], ['spend', 'logins']))
+          view = reg.get_view('behavior')
+          assert view.name == 'behavior'
+          assert 'spend' in view.features
+          views = reg.list_views()
+          assert len(views) == 1
+          print('registry OK, views =', [v['name'] for v in views])
+          PYEOF
+      - name: Test online store
+        run: |
+          python - <<'PYEOF'
+          from store.online_store import OnlineStore
+          store = OnlineStore()
+          store.write('features', 'CUST_001', {'spend': 150.0, 'logins': 5})
+          result = store.read('features', 'CUST_001')
+          assert result['spend'] == 150.0
+          assert result['logins'] == 5
+          missing = store.read('features', 'CUST_999')
+          assert missing is None
+          store.write_batch('features', [{'customer_id': 'A', 'v': 1}, {'customer_id': 'B', 'v': 2}], 'customer_id')
+          assert store.size == 4
+          print('online store OK, size =', store.size)
+          PYEOF
+      - name: Test point-in-time join
+        run: |
+          python - <<'PYEOF'
+          import pandas as pd
+          import numpy as np
+          from store.pit_join import point_in_time_join
+          entity_df = pd.DataFrame({
+              'customer_id': ['A', 'A', 'B'],
+              'event_timestamp': pd.to_datetime(['2024-03-01', '2024-06-01', '2024-04-01']),
+              'label': [1, 0, 1]
+          })
+          feature_df = pd.DataFrame({
+              'customer_id': ['A', 'A', 'B'],
+              'feature_timestamp': pd.to_datetime(['2024-01-15', '2024-05-01', '2024-03-01']),
+              'spend': [100.0, 200.0, 150.0]
+          })
+          result = point_in_time_join(entity_df, feature_df, 'customer_id',
+                                       feature_cols=['spend'])
+          assert len(result) == 3
+          # A at 2024-03-01 should see spend=100 (Jan), not 200 (May)
+          a_mar = result[(result['customer_id'] == 'A') & (result['event_timestamp'] == pd.Timestamp('2024-03-01'))]
+          assert float(a_mar['spend'].values[0]) == 100.0
+          print('PIT join OK - no leakage confirmed')
+          PYEOF
+      - name: Run demo
+        run: |
+          python - <<'PYEOF'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, 'demo.py'], capture_output=True, text=True)
+          assert r.returncode == 0, r.stderr[:200]
+          print('demo OK')
+          PYEOF
